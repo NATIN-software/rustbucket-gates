@@ -1,0 +1,43 @@
+# Spike version of the central RustBucket gate.
+#
+# Required on every repository with the custom property rustbucket=true by the
+# organization ruleset "rustbucket-default-branch" (rule type: workflows). It
+# runs in the target repository's pull request context with a read-only token;
+# this repository only holds the workflow definition.
+name: rustbucket-gates
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  rustbucket-gates:
+    name: rustbucket-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Gate spike-marker
+        shell: bash
+        run: |
+          if [ -e spike/fail.txt ]; then
+            echo "::error file=spike/fail.txt,line=1,title=gate spike-marker::Refused by gate spike-marker: spike/fail.txt is present. Fix: delete spike/fail.txt and push again."
+            echo "RUSTBUCKET-GATE-REFUSAL gate=spike-marker file=spike/fail.txt line=1 reason=marker-file-present fix=delete-spike/fail.txt"
+            {
+              echo "### Gate spike-marker: refused"
+              echo ""
+              echo "- Gate: spike-marker"
+              echo "- Location: spike/fail.txt, line 1"
+              echo "- Reason: marker file present"
+              echo "- Fix: delete spike/fail.txt and push again"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Gate spike-marker: passed"
+          echo "### Gate spike-marker: passed" >> "$GITHUB_STEP_SUMMARY"
