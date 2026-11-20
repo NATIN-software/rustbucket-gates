@@ -1,43 +1,359 @@
-# Spike version of the central RustBucket gate.
+# rustbucket-gates: probe-session SKELETON (round 2, step 2b).
 #
-# Required on every repository with the custom property rustbucket=true by the
-# organization ruleset "rustbucket-default-branch" (rule type: workflows). It
-# runs in the target repository's pull request context with a read-only token;
-# this repository only holds the workflow definition.
+# This workflow has the real job layout (see ops/DESIGN.md section 5.2) but no
+# real gates. Marker files under probe/ in the pull request decide what each
+# job does:
+#   probe/fail-static  gates-static refuses (exit 1)
+#   probe/fail-lint    gates-lint refuses (exit 1)
+#   probe/error-lint   gates-lint ends with status "error" (exit 1)
+#   probe/fail-test    gates-test refuses (exit 1)
+#   probe/hang-test    gates-test sleeps past its 3 minute timeout
+# Every job also logs facts the session must confirm: the workflow's own commit
+# and whether rustbucket-gates can be checked out at it (V2), and which tools
+# the runner has (V4).
+#
+# It is replaced by the real gates in I1. Keep secrets out: this file is public.
+
 name: rustbucket-gates
 
 on:
   pull_request:
-  merge_group:
 
 permissions:
   contents: read
 
+concurrency:
+  group: rustbucket-gates-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  rustbucket-gates:
-    name: rustbucket-gates
-    runs-on: ubuntu-latest
+  gates-static:
+    name: gates-static
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: project
+          fetch-depth: 2
           persist-credentials: false
-
-      - name: Gate spike-marker
+      - name: Check out gates (V2 probe)
+        id: gates
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NATIN-software/rustbucket-gates
+          ref: ${{ github.workflow_sha }}
+          path: gates
+          persist-credentials: false
+      - name: Probe
         shell: bash
+        env:
+          PROBE_JOB: gates-static
+          PROBE_MARKER: fail-static
+          CTX_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CTX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CTX_REPOSITORY: ${{ github.repository }}
+          CTX_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CTX_SHA: ${{ github.sha }}
+          GATES_OUTCOME: ${{ steps.gates.outcome }}
         run: |
-          if [ -e spike/fail.txt ]; then
-            echo "::error file=spike/fail.txt,line=1,title=gate spike-marker::Refused by gate spike-marker: spike/fail.txt is present. Fix: delete spike/fail.txt and push again."
-            echo "RUSTBUCKET-GATE-REFUSAL gate=spike-marker file=spike/fail.txt line=1 reason=marker-file-present fix=delete-spike/fail.txt"
-            {
-              echo "### Gate spike-marker: refused"
-              echo ""
-              echo "- Gate: spike-marker"
-              echo "- Location: spike/fail.txt, line 1"
-              echo "- Reason: marker file present"
-              echo "- Fix: delete spike/fail.txt and push again"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+          set +e
+          esc() {
+            local s=$1
+            s=${s//\\/\\\\}
+            s=${s//\"/\\\"}
+            printf '%s' "$s"
+          }
+          js() { printf '"%s"' "$(esc "$1")"; }
+          jn() {
+            case $1 in
+              ''|*[!0-9]*) printf '"unknown"' ;;
+              *) printf '%s' "$1" ;;
+            esac
+          }
+          ver() {
+            local out
+            if command -v "$1" >/dev/null 2>&1; then
+              out=$("$1" --version 2>&1 | head -n 1)
+              js "${out:-unknown}"
+            else
+              js absent
+            fi
+          }
+
+          gates_head=""
+          gates_has_workflow=false
+          if [ -d gates ]; then
+            gates_head=$(git -C gates rev-parse HEAD 2>/dev/null || true)
+            if [ -f gates/.github/workflows/rustbucket-gates.yml ]; then
+              gates_has_workflow=true
+            fi
           fi
-          echo "Gate spike-marker: passed"
-          echo "### Gate spike-marker: passed" >> "$GITHUB_STEP_SUMMARY"
+
+          printf 'RUSTBUCKET-PROBE-CONTEXT {"job":%s,"workflow_ref":%s,"workflow_sha":%s,"env_workflow_ref":%s,"env_workflow_sha":%s,"repository":%s,"pr_head_sha":%s,"merge_sha":%s,"gates_checkout":%s,"gates_head":%s,"gates_has_workflow":%s,"image_os":%s,"image_version":%s,"runner_name":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(js "$CTX_WORKFLOW_REF")" "$(js "$CTX_WORKFLOW_SHA")" \
+            "$(js "${GITHUB_WORKFLOW_REF:-}")" "$(js "${GITHUB_WORKFLOW_SHA:-}")" \
+            "$(js "$CTX_REPOSITORY")" "$(js "$CTX_PR_HEAD_SHA")" "$(js "$CTX_SHA")" \
+            "$(js "$GATES_OUTCOME")" "$(js "$gates_head")" "$gates_has_workflow" \
+            "$(js "${ImageOS:-}")" "$(js "${ImageVersion:-}")" "$(js "${RUNNER_NAME:-}")"
+
+          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)
+          disk_mb=$(df -Pm . 2>/dev/null | awk 'NR==2 {print $4}')
+          printf 'RUSTBUCKET-PROBE-TOOLS {"job":%s,"bash":%s,"git":%s,"jq":%s,"curl":%s,"rustup":%s,"cargo":%s,"rustc":%s,"python3":%s,"nproc":%s,"mem_total_kb":%s,"disk_free_mb":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(ver bash)" "$(ver git)" "$(ver jq)" "$(ver curl)" \
+            "$(ver rustup)" "$(ver cargo)" "$(ver rustc)" "$(ver python3)" \
+            "$(jn "$cpus")" "$(jn "$mem_kb")" "$(jn "$disk_mb")"
+
+          status=pass
+          findings=0
+          if [ -f "project/probe/$PROBE_MARKER" ]; then
+            printf 'RUSTBUCKET-GATE-REFUSAL {"v":1,"gate":"probe-%s","rule":"probe/marker","file":"probe/%s","line":1,"reason":"marker file present","fix":"delete probe/%s"}\n' \
+              "$(esc "$PROBE_JOB")" "$(esc "$PROBE_MARKER")" "$(esc "$PROBE_MARKER")"
+            status=refused
+            findings=1
+          fi
+          if [ -n "${PROBE_ERROR_MARKER:-}" ] && [ -f "project/probe/$PROBE_ERROR_MARKER" ]; then
+            status=error
+          fi
+          if [ -n "${PROBE_HANG_MARKER:-}" ] && [ -f "project/probe/$PROBE_HANG_MARKER" ]; then
+            printf 'RUSTBUCKET-PROBE-NOTE {"note":"hang marker present: sleeping past the job timeout"}\n'
+            sleep 600
+          fi
+
+          printf 'RUSTBUCKET-GATE-RESULT {"v":1,"gate":"probe-%s","job":%s,"status":%s,"findings":%s,"truncated":false,"gates_commit":%s}\n' \
+            "$(esc "$PROBE_JOB")" "$(js "$PROBE_JOB")" "$(js "$status")" "$findings" "$(js "$gates_head")"
+          [ "$status" = pass ]
+
+  gates-lint:
+    name: gates-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out gates (V2 probe)
+        id: gates
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NATIN-software/rustbucket-gates
+          ref: ${{ github.workflow_sha }}
+          path: gates
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        env:
+          PROBE_JOB: gates-lint
+          PROBE_MARKER: fail-lint
+          PROBE_ERROR_MARKER: error-lint
+          CTX_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CTX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CTX_REPOSITORY: ${{ github.repository }}
+          CTX_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CTX_SHA: ${{ github.sha }}
+          GATES_OUTCOME: ${{ steps.gates.outcome }}
+        run: |
+          set +e
+          esc() {
+            local s=$1
+            s=${s//\\/\\\\}
+            s=${s//\"/\\\"}
+            printf '%s' "$s"
+          }
+          js() { printf '"%s"' "$(esc "$1")"; }
+          jn() {
+            case $1 in
+              ''|*[!0-9]*) printf '"unknown"' ;;
+              *) printf '%s' "$1" ;;
+            esac
+          }
+          ver() {
+            local out
+            if command -v "$1" >/dev/null 2>&1; then
+              out=$("$1" --version 2>&1 | head -n 1)
+              js "${out:-unknown}"
+            else
+              js absent
+            fi
+          }
+
+          gates_head=""
+          gates_has_workflow=false
+          if [ -d gates ]; then
+            gates_head=$(git -C gates rev-parse HEAD 2>/dev/null || true)
+            if [ -f gates/.github/workflows/rustbucket-gates.yml ]; then
+              gates_has_workflow=true
+            fi
+          fi
+
+          printf 'RUSTBUCKET-PROBE-CONTEXT {"job":%s,"workflow_ref":%s,"workflow_sha":%s,"env_workflow_ref":%s,"env_workflow_sha":%s,"repository":%s,"pr_head_sha":%s,"merge_sha":%s,"gates_checkout":%s,"gates_head":%s,"gates_has_workflow":%s,"image_os":%s,"image_version":%s,"runner_name":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(js "$CTX_WORKFLOW_REF")" "$(js "$CTX_WORKFLOW_SHA")" \
+            "$(js "${GITHUB_WORKFLOW_REF:-}")" "$(js "${GITHUB_WORKFLOW_SHA:-}")" \
+            "$(js "$CTX_REPOSITORY")" "$(js "$CTX_PR_HEAD_SHA")" "$(js "$CTX_SHA")" \
+            "$(js "$GATES_OUTCOME")" "$(js "$gates_head")" "$gates_has_workflow" \
+            "$(js "${ImageOS:-}")" "$(js "${ImageVersion:-}")" "$(js "${RUNNER_NAME:-}")"
+
+          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)
+          disk_mb=$(df -Pm . 2>/dev/null | awk 'NR==2 {print $4}')
+          printf 'RUSTBUCKET-PROBE-TOOLS {"job":%s,"bash":%s,"git":%s,"jq":%s,"curl":%s,"rustup":%s,"cargo":%s,"rustc":%s,"python3":%s,"nproc":%s,"mem_total_kb":%s,"disk_free_mb":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(ver bash)" "$(ver git)" "$(ver jq)" "$(ver curl)" \
+            "$(ver rustup)" "$(ver cargo)" "$(ver rustc)" "$(ver python3)" \
+            "$(jn "$cpus")" "$(jn "$mem_kb")" "$(jn "$disk_mb")"
+
+          status=pass
+          findings=0
+          if [ -f "project/probe/$PROBE_MARKER" ]; then
+            printf 'RUSTBUCKET-GATE-REFUSAL {"v":1,"gate":"probe-%s","rule":"probe/marker","file":"probe/%s","line":1,"reason":"marker file present","fix":"delete probe/%s"}\n' \
+              "$(esc "$PROBE_JOB")" "$(esc "$PROBE_MARKER")" "$(esc "$PROBE_MARKER")"
+            status=refused
+            findings=1
+          fi
+          if [ -n "${PROBE_ERROR_MARKER:-}" ] && [ -f "project/probe/$PROBE_ERROR_MARKER" ]; then
+            status=error
+          fi
+          if [ -n "${PROBE_HANG_MARKER:-}" ] && [ -f "project/probe/$PROBE_HANG_MARKER" ]; then
+            printf 'RUSTBUCKET-PROBE-NOTE {"note":"hang marker present: sleeping past the job timeout"}\n'
+            sleep 600
+          fi
+
+          printf 'RUSTBUCKET-GATE-RESULT {"v":1,"gate":"probe-%s","job":%s,"status":%s,"findings":%s,"truncated":false,"gates_commit":%s}\n' \
+            "$(esc "$PROBE_JOB")" "$(js "$PROBE_JOB")" "$(js "$status")" "$findings" "$(js "$gates_head")"
+          [ "$status" = pass ]
+
+  gates-test:
+    name: gates-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: project
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check out gates (V2 probe)
+        id: gates
+        continue-on-error: true
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NATIN-software/rustbucket-gates
+          ref: ${{ github.workflow_sha }}
+          path: gates
+          persist-credentials: false
+      - name: Probe
+        shell: bash
+        env:
+          PROBE_JOB: gates-test
+          PROBE_MARKER: fail-test
+          PROBE_HANG_MARKER: hang-test
+          CTX_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CTX_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CTX_REPOSITORY: ${{ github.repository }}
+          CTX_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CTX_SHA: ${{ github.sha }}
+          GATES_OUTCOME: ${{ steps.gates.outcome }}
+        run: |
+          set +e
+          esc() {
+            local s=$1
+            s=${s//\\/\\\\}
+            s=${s//\"/\\\"}
+            printf '%s' "$s"
+          }
+          js() { printf '"%s"' "$(esc "$1")"; }
+          jn() {
+            case $1 in
+              ''|*[!0-9]*) printf '"unknown"' ;;
+              *) printf '%s' "$1" ;;
+            esac
+          }
+          ver() {
+            local out
+            if command -v "$1" >/dev/null 2>&1; then
+              out=$("$1" --version 2>&1 | head -n 1)
+              js "${out:-unknown}"
+            else
+              js absent
+            fi
+          }
+
+          gates_head=""
+          gates_has_workflow=false
+          if [ -d gates ]; then
+            gates_head=$(git -C gates rev-parse HEAD 2>/dev/null || true)
+            if [ -f gates/.github/workflows/rustbucket-gates.yml ]; then
+              gates_has_workflow=true
+            fi
+          fi
+
+          printf 'RUSTBUCKET-PROBE-CONTEXT {"job":%s,"workflow_ref":%s,"workflow_sha":%s,"env_workflow_ref":%s,"env_workflow_sha":%s,"repository":%s,"pr_head_sha":%s,"merge_sha":%s,"gates_checkout":%s,"gates_head":%s,"gates_has_workflow":%s,"image_os":%s,"image_version":%s,"runner_name":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(js "$CTX_WORKFLOW_REF")" "$(js "$CTX_WORKFLOW_SHA")" \
+            "$(js "${GITHUB_WORKFLOW_REF:-}")" "$(js "${GITHUB_WORKFLOW_SHA:-}")" \
+            "$(js "$CTX_REPOSITORY")" "$(js "$CTX_PR_HEAD_SHA")" "$(js "$CTX_SHA")" \
+            "$(js "$GATES_OUTCOME")" "$(js "$gates_head")" "$gates_has_workflow" \
+            "$(js "${ImageOS:-}")" "$(js "${ImageVersion:-}")" "$(js "${RUNNER_NAME:-}")"
+
+          cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+          mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)
+          disk_mb=$(df -Pm . 2>/dev/null | awk 'NR==2 {print $4}')
+          printf 'RUSTBUCKET-PROBE-TOOLS {"job":%s,"bash":%s,"git":%s,"jq":%s,"curl":%s,"rustup":%s,"cargo":%s,"rustc":%s,"python3":%s,"nproc":%s,"mem_total_kb":%s,"disk_free_mb":%s}\n' \
+            "$(js "$PROBE_JOB")" "$(ver bash)" "$(ver git)" "$(ver jq)" "$(ver curl)" \
+            "$(ver rustup)" "$(ver cargo)" "$(ver rustc)" "$(ver python3)" \
+            "$(jn "$cpus")" "$(jn "$mem_kb")" "$(jn "$disk_mb")"
+
+          status=pass
+          findings=0
+          if [ -f "project/probe/$PROBE_MARKER" ]; then
+            printf 'RUSTBUCKET-GATE-REFUSAL {"v":1,"gate":"probe-%s","rule":"probe/marker","file":"probe/%s","line":1,"reason":"marker file present","fix":"delete probe/%s"}\n' \
+              "$(esc "$PROBE_JOB")" "$(esc "$PROBE_MARKER")" "$(esc "$PROBE_MARKER")"
+            status=refused
+            findings=1
+          fi
+          if [ -n "${PROBE_ERROR_MARKER:-}" ] && [ -f "project/probe/$PROBE_ERROR_MARKER" ]; then
+            status=error
+          fi
+          if [ -n "${PROBE_HANG_MARKER:-}" ] && [ -f "project/probe/$PROBE_HANG_MARKER" ]; then
+            printf 'RUSTBUCKET-PROBE-NOTE {"note":"hang marker present: sleeping past the job timeout"}\n'
+            sleep 600
+          fi
+
+          printf 'RUSTBUCKET-GATE-RESULT {"v":1,"gate":"probe-%s","job":%s,"status":%s,"findings":%s,"truncated":false,"gates_commit":%s}\n' \
+            "$(esc "$PROBE_JOB")" "$(js "$PROBE_JOB")" "$(js "$status")" "$findings" "$(js "$gates_head")"
+          [ "$status" = pass ]
+
+  rustbucket-gates:
+    name: rustbucket-gates
+    needs: [gates-static, gates-lint, gates-test]
+    if: always()
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate
+        shell: bash
+        env:
+          R_STATIC: ${{ needs.gates-static.result }}
+          R_LINT: ${{ needs.gates-lint.result }}
+          R_TEST: ${{ needs.gates-test.result }}
+        run: |
+          set +e
+          esc() {
+            local s=$1
+            s=${s//\\/\\\\}
+            s=${s//\"/\\\"}
+            printf '%s' "$s"
+          }
+          status=pass
+          for r in "$R_STATIC" "$R_LINT" "$R_TEST"; do
+            [ "$r" = success ] || status=refused
+          done
+          printf 'RUSTBUCKET-GATE-RESULT {"v":1,"gate":"aggregate","job":"rustbucket-gates","status":"%s","needs":{"gates-static":"%s","gates-lint":"%s","gates-test":"%s"}}\n' \
+            "$status" "$(esc "$R_STATIC")" "$(esc "$R_LINT")" "$(esc "$R_TEST")"
+          [ "$status" = pass ]
